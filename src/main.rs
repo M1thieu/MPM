@@ -40,17 +40,11 @@ struct Grid {
 impl Grid {
     fn world_to_grid(&self, world_pos: Vec2) -> UVec2 {
         let rel_pos = world_pos - self.origin;
-        UVec2::new(
-            (rel_pos.x / self.cell_size).floor() as u32,
-            (rel_pos.y / self.cell_size).floor() as u32
-        )
+        UVec2::new((rel_pos.x / self.cell_size).floor() as u32, (rel_pos.y / self.cell_size).floor() as u32)
     }
     
     fn grid_to_world(&self, grid_pos: UVec2) -> Vec2 {
-        self.origin + Vec2::new(
-            (grid_pos.x as f32 + 0.5) * self.cell_size,
-            (grid_pos.y as f32 + 0.5) * self.cell_size
-        )
+        self.origin + Vec2::new((grid_pos.x as f32 + 0.5) * self.cell_size, (grid_pos.y as f32 + 0.5) * self.cell_size)
     }
     
     fn in_bounds(&self, grid_pos: UVec2) -> bool {
@@ -80,39 +74,13 @@ fn main() {
             show_grid: true,
         })
         .add_systems(Startup, (setup, initialize_grid, spawn_particles))
-        .add_systems(Update, (
-            update_particles, 
-            render_particles,
-            render_grid
-        ))
+        .add_systems(Update, (reset_grid, update_particles, render_particles, render_grid))
         .run();
 }
 
 // Setup camera
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d::default());
-}
-
-// Initialize the grid
-fn initialize_grid(mut commands: Commands, windows: Query<&Window>) {
-    let window = windows.single();
-    let cells_x = (window.width() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
-    let cells_y = (window.height() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
-    let origin = Vec2::new(
-        -window.width()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE),
-        -window.height()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE)
-    );
-    let total_cells = (cells_x * cells_y) as usize;
-    
-    commands.insert_resource(Grid {
-        cell_size: GRID_CELL_SIZE,
-        dimensions: UVec2::new(cells_x, cells_y),
-        world_bounds: Vec2::new(window.width(), window.height()),
-        origin,
-        cell_mass: vec![0.0; total_cells],
-        cell_velocity: vec![Vec2::ZERO; total_cells],
-        cell_momentum: vec![Vec2::ZERO; total_cells],
-    });
 }
 
 // Spawn initial particles
@@ -136,6 +104,28 @@ fn spawn_particles(mut commands: Commands, windows: Query<&Window>) {
             mass: 1.0 
         });
     }
+}
+
+// Initialize the grid
+fn initialize_grid(mut commands: Commands, windows: Query<&Window>) {
+    let window = windows.single();
+    let cells_x = (window.width() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
+    let cells_y = (window.height() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
+    let origin = Vec2::new(
+        -window.width()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE),
+        -window.height()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE)
+    );
+    let total_cells = (cells_x * cells_y) as usize;
+    
+    commands.insert_resource(Grid {
+        cell_size: GRID_CELL_SIZE,
+        dimensions: UVec2::new(cells_x, cells_y),
+        world_bounds: Vec2::new(window.width(), window.height()),
+        origin,
+        cell_mass: vec![0.0; total_cells],
+        cell_velocity: vec![Vec2::ZERO; total_cells],
+        cell_momentum: vec![Vec2::ZERO; total_cells],
+    });
 }
 
 // Simple particle update with boundary collisions
@@ -172,15 +162,19 @@ fn update_particles(mut particles: Query<&mut Particle>, windows: Query<&Window>
 
 // Render particles
 fn render_particles(mut gizmos: Gizmos, particles: Query<&Particle>) {
-    for particle in &particles {
-        gizmos.circle_2d(particle.position, PARTICLE_RADIUS, Color::WHITE);
+    for p in &particles { 
+        gizmos.circle_2d(p.position, PARTICLE_RADIUS, Color::WHITE); 
     }
+}
+
+// Reset the grid at the beginning of each frame
+fn reset_grid(mut grid: ResMut<Grid>) { 
+    grid.reset(); 
 }
 
 // Render the grid
 fn render_grid(mut gizmos: Gizmos, grid: Res<Grid>, params: Res<SimParams>) {
     if !params.show_grid { return; }
-    
     let color = Color::rgba(0.3, 0.3, 0.8, 0.2);
     
     // Draw horizontal grid lines
@@ -189,8 +183,7 @@ fn render_grid(mut gizmos: Gizmos, grid: Res<Grid>, params: Res<SimParams>) {
         gizmos.line_2d(
             Vec2::new(grid.origin.x, y_pos),
             Vec2::new(grid.origin.x + grid.dimensions.x as f32 * grid.cell_size, y_pos),
-            color
-        );
+            color);
     }
     
     // Draw vertical grid lines
@@ -199,7 +192,6 @@ fn render_grid(mut gizmos: Gizmos, grid: Res<Grid>, params: Res<SimParams>) {
         gizmos.line_2d(
             Vec2::new(x_pos, grid.origin.y),
             Vec2::new(x_pos, grid.origin.y + grid.dimensions.y as f32 * grid.cell_size),
-            color
-        );
+            color);
     }
 }
