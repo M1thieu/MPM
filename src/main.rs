@@ -74,10 +74,10 @@ fn main() {
             show_grid: true,
         })
         .add_systems(Startup, (setup, initialize_grid, spawn_particles))
-        .add_systems(Update, (reset_grid, update_particles, render_particles, render_grid))
+        .add_systems(Update, (reset_grid, transfer_particles_to_grid, transfer_grid_to_particles, 
+                             update_particles, render_particles, render_grid))
         .run();
 }
-
 // Setup camera
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d::default());
@@ -126,6 +126,64 @@ fn initialize_grid(mut commands: Commands, windows: Query<&Window>) {
         cell_velocity: vec![Vec2::ZERO; total_cells],
         cell_momentum: vec![Vec2::ZERO; total_cells],
     });
+}
+
+// Transfer particle properties to grid
+fn transfer_particles_to_grid(particles: Query<&Particle>, mut grid: ResMut<Grid>, params: Res<SimParams>) {
+    for particle in &particles {
+        let particle_cell = grid.world_to_grid(particle.position);
+        
+        // Apply quadratic B-spline weights (3×3 stencil)
+        for dy in 0..3 {
+            for dx in 0..3 {
+                let grid_pos = UVec2::new(
+                    particle_cell.x.saturating_add(dx).saturating_sub(1),
+                    particle_cell.y.saturating_add(dy).saturating_sub(1));
+                
+                if !grid.in_bounds(grid_pos) { continue; }
+                
+                // Calculate weight based on distance
+                let node_pos = grid.grid_to_world(grid_pos);
+                let distance = particle.position - node_pos;
+                let nx = distance.x / grid.cell_size;
+                let ny = distance.y / grid.cell_size;
+                
+                // Quadratic B-spline weight calculation
+                let wx = match dx {
+                    0 => 0.5 * (0.5 - nx).powi(2),
+                    1 => 0.75 - nx.powi(2),
+                    2 => 0.5 * (0.5 + nx).powi(2),
+                    _ => 0.0
+                };
+                
+                let wy = match dy {
+                    0 => 0.5 * (0.5 - ny).powi(2),
+                    1 => 0.75 - ny.powi(2),
+                    2 => 0.5 * (0.5 + ny).powi(2),
+                    _ => 0.0
+                };
+                
+                let cell_idx = grid.get_index(grid_pos);
+                let weight = wx * wy;
+                
+                // Transfer mass and momentum
+                grid.cell_mass[cell_idx] += particle.mass * weight;
+                grid.cell_momentum[cell_idx] += particle.mass * particle.velocity * weight;
+            }
+        }
+    }
+    
+    // Calculate velocities from momentum
+    for i in 0..grid.cell_mass.len() {
+        if grid.cell_mass[i] > 0.0 {
+            grid.cell_velocity[i] = grid.cell_momentum[i] / grid.cell_mass[i] + params.gravity * params.dt;
+        }
+    }
+}
+
+// Transfer grid properties back to particles
+fn transfer_grid_to_particles(_particles: Query<&mut Particle>, _grid: Res<Grid>) {
+    // Implementation will be added in the next steps
 }
 
 // Simple particle update with boundary collisions
