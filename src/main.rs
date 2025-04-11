@@ -1,39 +1,340 @@
 use bevy::prelude::*;
 
-const PARTICLE_COUNT: usize = 1000;
-const PARTICLE_RADIUS: f32 = 2.0;
-const GRAVITY: Vec2 = Vec2::new(0.0, -98.0);
-const RESTITUTION: f32 = 0.9;
-const GRID_CELL_SIZE: f32 = 10.0;
-const GRID_MARGIN: usize = 1;
+// Core Components
+#[derive(Component, Default, Debug, Clone, Copy)]
+pub struct Position(pub Vec2);
 
-#[derive(Component)]
-struct Particle { position: Vec2, velocity: Vec2, mass: f32 }
+#[derive(Component, Default, Debug, Clone, Copy)]
+pub struct Velocity(pub Vec2);
 
-#[derive(Resource)]
-struct SimParams { gravity: Vec2, dt: f32, restitution: f32, show_grid: bool }
+#[derive(Component, Default, Debug, Clone, Copy)]
+pub struct Mass(pub f32);
 
-#[derive(Resource)]
-struct Grid {
-    cell_size: f32, dimensions: UVec2, world_bounds: Vec2, origin: Vec2,
-    cell_mass: Vec<f32>, cell_velocity: Vec<Vec2>, cell_momentum: Vec<Vec2>,
+#[derive(Component, Default, Debug, Clone, Copy)]
+pub struct AffineMomentum(pub Mat2);
+
+#[derive(Component, Default, Debug, Clone)]
+pub struct ParticleTag;
+
+#[derive(Component, Default, Debug, Clone)]
+pub struct CellMassMomentumContributions(pub [GridMassAndMomentumChange; 9]);
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct GridMassAndMomentumChange(pub usize, pub f32, pub Vec2);
+
+// Grid Cell data
+#[derive(Default, Debug, Clone, Copy)]
+pub struct GridCell {
+    pub mass: f32,
+    pub velocity: Vec2,
+}
+
+// Grid Resource
+#[derive(Resource, Default, Debug, Clone)]
+pub struct Grid {
+    pub width: usize,
+    pub height: usize,
+    pub cells: Vec<GridCell>,
 }
 
 impl Grid {
-    fn world_to_grid(&self, world_pos: Vec2) -> UVec2 {
-        let rel_pos = world_pos - self.origin;
-        UVec2::new((rel_pos.x / self.cell_size).floor() as u32, (rel_pos.y / self.cell_size).floor() as u32)
+    pub fn new(width: usize, height: usize) -> Self {
+        let num_cells = width * height;
+        let mut cells = Vec::with_capacity(num_cells);
+        cells.resize_with(num_cells, Default::default);
+
+        Self {
+            width,
+            height,
+            cells,
+        }
     }
-    fn grid_to_world(&self, grid_pos: UVec2) -> Vec2 {
-        self.origin + Vec2::new((grid_pos.x as f32 + 0.5) * self.cell_size, (grid_pos.y as f32 + 0.5) * self.cell_size)
+
+    pub fn index_at(&self, x: usize, y: usize) -> usize {
+        // Clamp to grid boundaries
+        let x = x.clamp(0, self.width - 1);
+        let y = y.clamp(0, self.height - 1);
+        y * self.width + x
     }
-    fn in_bounds(&self, grid_pos: UVec2) -> bool { grid_pos.x < self.dimensions.x && grid_pos.y < self.dimensions.y }
-    fn get_index(&self, grid_pos: UVec2) -> usize { (grid_pos.y * self.dimensions.x + grid_pos.x) as usize }
-    fn reset(&mut self) {
-        for i in 0..self.cell_mass.len() {
-            self.cell_mass[i] = 0.0;
-            self.cell_momentum[i] = Vec2::ZERO;
-            self.cell_velocity[i] = Vec2::ZERO;
+
+    pub fn update(&mut self, dt: f32, gravity: f32) {
+        // Update grid velocities based on forces (like gravity)
+        for cell in &mut self.cells {
+            if cell.mass > 0.0 {
+                // Apply gravity
+                cell.velocity.y += gravity * dt;
+
+                // Normalize velocity by mass (needed after P2G transfer)
+                cell.velocity /= cell.mass;
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        // Reset grid cells for the next simulation step
+        for cell in &mut self.cells {
+            cell.mass = 0.0;
+            cell.velocity = Vec2::ZERO;
+        }
+    }
+}
+
+// World State Parameters
+#[derive(Resource, Debug, Clone)]
+pub struct WorldState {
+    pub dt: f32,
+    pub gravity: f32,
+    pub gravity_enabled: bool,
+    pub time: f32,
+    pub iteration: usize,
+}
+
+impl Default for WorldState {
+    fn default() -> Self {
+        Self {
+            dt: 1.0 / 60.0,
+            gravity: -9.81,
+            gravity_enabled: true,
+            time: 0.0,
+            iteration: 0,
+        }
+    }
+}
+
+impl WorldState {
+    pub fn update(&mut self) {
+        self.time += self.dt;
+        self.iteration += 1;
+    }
+}
+
+// Interpolation functions for MPM
+pub fn quadratic_interpolation_weights(diff: Vec2) -> [Vec2; 3] {
+    let mut weights = [Vec2::ZERO; 3];
+
+    // Quadratic interpolation weights - using quadratic B-splines
+    // For x-direction
+    let x = diff.x;
+    weights[0].x = 0.5 * (0.5 - x) * (0.5 - x);
+    weights[1].x = 0.75 - x * x;
+    weights[2].x = 0.5 * (0.5 + x) * (0.5 + x);
+
+    // For y-direction
+    let y = diff.y;
+    weights[0].y = 0.5 * (0.5 - y) * (0.5 - y);
+    weights[1].y = 0.75 - y * y;
+    weights[2].y = 0.5 * (0.5 + y) * (0.5 + y);
+
+    weights
+}
+
+// Helper for APIC calculation
+pub fn weighted_velocity_and_cell_dist_to_term(weighted_velocity: Vec2, cell_dist: Vec2) -> Mat2 {
+    Mat2::from_cols(
+        weighted_velocity * cell_dist.x,
+        weighted_velocity * cell_dist.y,
+    )
+}
+
+// MPM Algorithm systems
+
+// P2G (Particles to Grid) step
+pub fn particles_to_grid(
+    mut grid: ResMut<Grid>,
+    particles: Query<(&Position, &Velocity, &Mass), With<ParticleTag>>,
+) {
+    // Reset grid before transferring particle data
+    grid.reset();
+
+    for (position, velocity, mass) in particles.iter() {
+        let cell_x: u32 = position.0.x as u32;
+        let cell_y: u32 = position.0.y as u32;
+        let cell_diff = Vec2::new(
+            position.0.x - cell_x as f32 - 0.5,
+            position.0.y - cell_y as f32 - 0.5,
+        );
+        let weights = quadratic_interpolation_weights(cell_diff);
+
+        // Transfer mass and momentum to surrounding 9 cells
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = weights[gx].x * weights[gy].y;
+                let cell_pos_x = (cell_x as i32 + gx as i32) - 1;
+                let cell_pos_y = (cell_y as i32 + gy as i32) - 1;
+                let cell_index = grid.index_at(cell_pos_x as usize, cell_pos_y as usize);
+
+                // PIC transfer (mass and velocity)
+                grid.cells[cell_index].mass += weight * mass.0;
+                grid.cells[cell_index].velocity += weight * velocity.0 * mass.0;
+            }
+        }
+    }
+}
+
+// Grid update step
+pub fn update_grid(mut grid: ResMut<Grid>, mut world: ResMut<WorldState>) {
+    world.update();
+    grid.update(
+        world.dt,
+        if world.gravity_enabled {
+            world.gravity
+        } else {
+            0.0
+        },
+    );
+}
+
+// G2P (Grid to Particles) step
+pub fn grid_to_particles(
+    world: Res<WorldState>,
+    grid: Res<Grid>,
+    mut particles: Query<(&mut Position, &mut Velocity), With<ParticleTag>>,
+) {
+    for (mut position, mut velocity) in particles.iter_mut() {
+        // Reset particle velocity - will be recalculated from grid
+        velocity.0 = Vec2::ZERO;
+
+        let cell_x: u32 = position.0.x as u32;
+        let cell_y: u32 = position.0.y as u32;
+        let cell_diff = Vec2::new(
+            position.0.x - cell_x as f32 - 0.5,
+            position.0.y - cell_y as f32 - 0.5,
+        );
+        let weights = quadratic_interpolation_weights(cell_diff);
+
+        // Gather velocity from surrounding cells
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = weights[gx].x * weights[gy].y;
+                let cell_pos_x = (cell_x as i32 + gx as i32) - 1;
+                let cell_pos_y = (cell_y as i32 + gy as i32) - 1;
+                let cell_index = grid.index_at(cell_pos_x as usize, cell_pos_y as usize);
+
+                // Transfer velocity from grid to particle
+                velocity.0 += grid.cells[cell_index].velocity * weight;
+            }
+        }
+
+        // Advect particles using velocity
+        position.0 += velocity.0 * world.dt;
+
+        // Boundary conditions - keep particles inside grid
+        position.0.x = position.0.x.clamp(1.0, (grid.width - 2) as f32);
+        position.0.y = position.0.y.clamp(1.0, (grid.height - 2) as f32);
+    }
+}
+
+// Spawn particles in a square region
+pub fn spawn_particles(
+    commands: &mut Commands,
+    start_x: f32,
+    start_y: f32,
+    width: f32,
+    height: f32,
+    spacing: f32,
+    mass: f32,
+) {
+    let cols = (width / spacing) as usize;
+    let rows = (height / spacing) as usize;
+
+    for i in 0..rows {
+        for j in 0..cols {
+            let position = Vec2::new(start_x + j as f32 * spacing, start_y + i as f32 * spacing);
+
+            commands.spawn((
+                Position(position),
+                Velocity(Vec2::ZERO),
+                Mass(mass),
+                ParticleTag,
+                CellMassMomentumContributions([GridMassAndMomentumChange(0, 0.0, Vec2::ZERO); 9]),
+                // Add these components to fix hierarchy warnings
+                Transform::default(),
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+            ));
+        }
+    }
+}
+
+// Plugin for MPM simulation
+pub struct MPMPlugin;
+
+impl Plugin for MPMPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(Grid::new(100, 100)) // Larger grid for more space
+            .insert_resource(WorldState {
+                dt: 1.0 / 120.0, // Higher framerate for stability
+                gravity: -5.0,   // Less extreme gravity
+                gravity_enabled: true,
+                time: 0.0,
+                iteration: 0,
+            })
+            .add_systems(
+                Update,
+                (
+                    particles_to_grid,
+                    update_grid.after(particles_to_grid),
+                    grid_to_particles.after(update_grid),
+                )
+                    .chain(),
+            );
+    }
+}
+
+// Visual representation of particles
+#[derive(Component)]
+struct ParticleSprite;
+
+// Setup system
+fn setup(mut commands: Commands) {
+    // Add a simple 2D camera with some zoom
+    commands.spawn(Camera2d::default());
+
+    // Create a dam break scenario - a tall column of particles on the left side
+    spawn_particles(
+        &mut commands,
+        5.0,  // start_x - near the left edge
+        5.0,  // start_y - from bottom
+        15.0, // width - compact block
+        50.0, // height - tall column
+        0.8,  // spacing - slightly denser
+        1.0,  // mass
+    );
+}
+
+// Render particles
+fn render_particles(
+    mut commands: Commands,
+    particles: Query<(Entity, &Position), With<ParticleTag>>,
+    mut existing_sprites: Query<(&mut Transform, &mut Sprite, &ParticleSprite)>,
+) {
+    // Create sprites if we don't have enough
+    let particle_count = particles.iter().count();
+    let sprite_count = existing_sprites.iter().count();
+
+    // Spawn more sprites if needed
+    if sprite_count < particle_count {
+        for _ in 0..(particle_count - sprite_count) {
+            commands.spawn((
+                Sprite {
+                    color: Color::rgb(0.2, 0.6, 0.9), // Water blue color
+                    custom_size: Some(Vec2::new(1.0, 1.0)),
+                    ..Default::default()
+                },
+                Transform::default(),
+                ParticleSprite,
+            ));
+        }
+    }
+
+    // Update sprite positions based on particles
+    let mut sprites = existing_sprites.iter_mut();
+    for (_, position) in &particles {
+        if let Some((mut transform, _, _)) = sprites.next() {
+            transform.translation.x = position.0.x;
+            transform.translation.y = position.0.y;
+            transform.translation.z = 1.0; // Make sure it's visible
         }
     }
 }
@@ -41,165 +342,8 @@ impl Grid {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(SimParams { gravity: GRAVITY, dt: 1.0/60.0, restitution: RESTITUTION, show_grid: true })
-        .add_systems(Startup, (setup, initialize_grid, spawn_particles))
-        .add_systems(Update, (reset_grid, transfer_particles_to_grid, transfer_grid_to_particles, 
-                             update_particles, render_particles, render_grid))
+        .add_plugins(MPMPlugin)
+        .add_systems(Startup, setup)
+        .add_systems(Update, render_particles)
         .run();
-}
-
-fn setup(mut commands: Commands) { commands.spawn(Camera2d::default()); }
-
-fn initialize_grid(mut commands: Commands, windows: Query<&Window>) {
-    let window = windows.single();
-    let cells_x = (window.width() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
-    let cells_y = (window.height() / GRID_CELL_SIZE).ceil() as u32 + (GRID_MARGIN as u32 * 2);
-    let origin = Vec2::new(-window.width()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE),
-                          -window.height()/2.0 - (GRID_MARGIN as f32 * GRID_CELL_SIZE));
-    let total_cells = (cells_x * cells_y) as usize;
-    
-    commands.insert_resource(Grid {
-        cell_size: GRID_CELL_SIZE, dimensions: UVec2::new(cells_x, cells_y),
-        world_bounds: Vec2::new(window.width(), window.height()), origin,
-        cell_mass: vec![0.0; total_cells],
-        cell_velocity: vec![Vec2::ZERO; total_cells],
-        cell_momentum: vec![Vec2::ZERO; total_cells],
-    });
-}
-
-fn reset_grid(mut grid: ResMut<Grid>) { grid.reset(); }
-
-fn transfer_particles_to_grid(particles: Query<&Particle>, mut grid: ResMut<Grid>, params: Res<SimParams>) {
-    for particle in &particles {
-        let particle_cell = grid.world_to_grid(particle.position);
-        
-        // Apply quadratic B-spline weights (3×3 stencil)
-        for dy in 0..3 {
-            for dx in 0..3 {
-                let grid_pos = UVec2::new(
-                    particle_cell.x.saturating_add(dx).saturating_sub(1),
-                    particle_cell.y.saturating_add(dy).saturating_sub(1));
-                
-                if !grid.in_bounds(grid_pos) { continue; }
-                
-                // Calculate weight based on distance
-                let node_pos = grid.grid_to_world(grid_pos);
-                let distance = particle.position - node_pos;
-                let nx = distance.x / grid.cell_size;
-                let ny = distance.y / grid.cell_size;
-                
-                // Quadratic B-spline weight calculation
-                let wx = match dx {
-                    0 => 0.5 * (0.5 - nx).powi(2),
-                    1 => 0.75 - nx.powi(2),
-                    2 => 0.5 * (0.5 + nx).powi(2),
-                    _ => 0.0
-                };
-                
-                let wy = match dy {
-                    0 => 0.5 * (0.5 - ny).powi(2),
-                    1 => 0.75 - ny.powi(2),
-                    2 => 0.5 * (0.5 + ny).powi(2),
-                    _ => 0.0
-                };
-                
-                let cell_idx = grid.get_index(grid_pos);
-                let weight = wx * wy;
-                
-                // Transfer mass and momentum
-                grid.cell_mass[cell_idx] += particle.mass * weight;
-                grid.cell_momentum[cell_idx] += particle.mass * particle.velocity * weight;
-            }
-        }
-    }
-    
-    // Calculate velocities from momentum
-    for i in 0..grid.cell_mass.len() {
-        if grid.cell_mass[i] > 0.0 {
-            grid.cell_velocity[i] = grid.cell_momentum[i] / grid.cell_mass[i] + params.gravity * params.dt;
-        }
-    }
-}
-
-fn transfer_grid_to_particles(_particles: Query<&mut Particle>, _grid: Res<Grid>) {
-    // Implementation will be added in the next steps
-}
-
-fn spawn_particles(mut commands: Commands, windows: Query<&Window>) {
-    let window = windows.single();
-    let width = window.width();
-    let height = window.height();
-    let cols = (PARTICLE_COUNT as f32).sqrt().ceil() as usize;
-    let rows = (PARTICLE_COUNT + cols - 1) / cols;
-    let spacing = Vec2::new(width / (cols as f32 + 1.0), height / (rows as f32 + 1.0));
-    
-    for i in 0..PARTICLE_COUNT {
-        let pos = Vec2::new(
-            ((i % cols) as f32 + 0.5) * spacing.x - width / 2.0,
-            ((i / cols) as f32 + 0.5) * spacing.y - height / 2.0);
-        let dir = pos.normalize_or_zero();
-        commands.spawn(Particle { 
-            position: pos,
-            velocity: Vec2::new(dir.y * 20.0, -dir.x * 20.0),
-            mass: 1.0 
-        });
-    }
-}
-
-fn update_particles(mut particles: Query<&mut Particle>, windows: Query<&Window>, params: Res<SimParams>) {
-    let bounds = Vec2::new(windows.single().width() / 2.0, windows.single().height() / 2.0);
-    
-    for mut particle in &mut particles {
-        // Apply gravity, only for testing purposes not to implement in final product
-        //particle.velocity += params.gravity * params.dt;
-        
-        // Update position
-        let velocity = particle.velocity;
-        particle.position += velocity * params.dt;
-        
-        // Boundary collisions (X-axis)
-        if particle.position.x < -bounds.x + PARTICLE_RADIUS {
-            particle.position.x = -bounds.x + PARTICLE_RADIUS;
-            particle.velocity.x *= -params.restitution;
-        } else if particle.position.x > bounds.x - PARTICLE_RADIUS {
-            particle.position.x = bounds.x - PARTICLE_RADIUS;
-            particle.velocity.x *= -params.restitution;
-        }
-        
-        // Boundary collisions (Y-axis)
-        if particle.position.y < -bounds.y + PARTICLE_RADIUS {
-            particle.position.y = -bounds.y + PARTICLE_RADIUS;
-            particle.velocity.y *= -params.restitution;
-        } else if particle.position.y > bounds.y - PARTICLE_RADIUS {
-            particle.position.y = bounds.y - PARTICLE_RADIUS;
-            particle.velocity.y *= -params.restitution;
-        }
-    }
-}
-
-fn render_particles(mut gizmos: Gizmos, particles: Query<&Particle>) {
-    for p in &particles { gizmos.circle_2d(p.position, PARTICLE_RADIUS, Color::WHITE); }
-}
-
-fn render_grid(mut gizmos: Gizmos, grid: Res<Grid>, params: Res<SimParams>) {
-    if !params.show_grid { return; }
-    let color = Color::srgba(0.3, 0.3, 0.8, 0.2);
-    
-    // Draw horizontal grid lines
-    for y in 0..=grid.dimensions.y {
-        let y_pos = grid.origin.y + y as f32 * grid.cell_size;
-        gizmos.line_2d(
-            Vec2::new(grid.origin.x, y_pos),
-            Vec2::new(grid.origin.x + grid.dimensions.x as f32 * grid.cell_size, y_pos),
-            color);
-    }
-    
-    // Draw vertical grid lines
-    for x in 0..=grid.dimensions.x {
-        let x_pos = grid.origin.x + x as f32 * grid.cell_size;
-        gizmos.line_2d(
-            Vec2::new(x_pos, grid.origin.y),
-            Vec2::new(x_pos, grid.origin.y + grid.dimensions.y as f32 * grid.cell_size),
-            color);
-    }
 }
